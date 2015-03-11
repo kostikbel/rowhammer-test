@@ -324,7 +324,8 @@ uint64_t HammerAllReachablePages(uint64_t presumed_row_size,
   std::vector<std::vector<uint8_t*>> pages_per_row;
   uint64_t total_bitflips = 0;
 
-  pages_per_row.resize(memory_mapping_size / presumed_row_size);
+  printf("mms %#lx prs %#lx\n", memory_mapping_size, presumed_row_size);
+  pages_per_row.resize(GetPhysicalMemorySize() / presumed_row_size);
 #ifdef __linux__
   int pagemap = open("/proc/self/pagemap", O_RDONLY);
   assert(pagemap >= 0);
