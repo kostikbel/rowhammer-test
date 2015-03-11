@@ -24,13 +24,23 @@
 // to 0.9 or so). Normally writes to stdout, but if -f is provided, will fork
 // and write to the specified file instead.
 
+#include <sys/types.h>
+#ifdef __linux__
 #include <asm/unistd.h>
+#endif
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#ifdef __linux__
 #include <linux/kernel-page-flags.h>
 #include <linux/perf_event.h>
+#endif
+#ifdef __FreeBSD__
+#include <sys/sysctl.h>
+#include <sys/user.h>
+#include <machine/pcb.h>
+#endif
 #include <map>
 #include <stdint.h>
 #include <stdio.h>
@@ -41,7 +51,9 @@
 #include <sys/mount.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#ifdef __linux__
 #include <sys/sysinfo.h>
+#endif
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -57,11 +69,23 @@ uint64_t number_of_seconds_to_hammer = 3600;
 uint64_t number_of_reads = 1000*1024;
 
 // Obtain the size of the physical memory of the system.
+#if defined(__linux__)
 uint64_t GetPhysicalMemorySize() {
   struct sysinfo info;
   sysinfo( &info );
   return (size_t)info.totalram * (size_t)info.mem_unit;
 }
+#elif defined(__FreeBSD__)
+uint64_t GetPhysicalMemorySize() {
+  unsigned long memsize;
+  size_t len;
+  len = sizeof(memsize);
+  sysctlbyname("hw.physmem", &memsize, &len, NULL, 0);
+  return memsize;
+}
+#else
+#error Port me
+#endif
 
 // If physical_address is in the range, put (physical_address, virtual_address)
 // into the map.
@@ -88,6 +112,7 @@ bool IsRangeInMap(const std::pair<uint64_t, uint64_t>& range,
   return true;
 }
 
+#ifdef __linux__
 uint64_t GetPageFrameNumber(int pagemap, uint8_t* virtual_address) {
     // Read the entry in the pagemap.
     off_t pos = lseek(pagemap,
@@ -98,6 +123,65 @@ uint64_t GetPageFrameNumber(int pagemap, uint8_t* virtual_address) {
     uint64_t page_frame_number = value & ((1ULL << 54)-1);
     return page_frame_number; 
 }
+#endif
+
+#ifdef __FreeBSD__
+#define	PAGE_FRAME (~((1ULL << 63) | 0xfff))
+#define	PDE_PS 0x80
+u_long *memmap, *root;
+
+uintptr_t freebsd_get_pcb() {
+  struct kinfo_proc kip;
+  int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
+  size_t len;
+  len = sizeof(kip);
+  sysctl(mib, nitems(mib), &kip, &len, 0, 0);
+  return reinterpret_cast<uintptr_t>(kip.ki_pcb);
+}
+
+void freebsd_init() {
+  struct pcb *pcb;
+  int fd;
+  fd = open("/dev/mem", O_RDONLY);
+  assert(fd >= 0);
+  memmap = reinterpret_cast<u_long *>(mmap(NULL, GetPhysicalMemorySize(),
+    PROT_READ, MAP_SHARED, fd, 0));
+  if (memmap == MAP_FAILED) {
+    fprintf(stderr, "mmap failed %s\n", strerror(errno));
+    exit(1);
+  }
+  close(fd);
+
+  uintptr_t kpcb = freebsd_get_pcb();
+  fd = open("/dev/kmem", O_RDONLY);
+  assert(fd >= 0);
+  void *kmemmap = mmap(NULL, PAGE_SIZE * 2, PROT_READ, MAP_SHARED, fd,
+      kpcb & PAGE_FRAME);
+  if (kmemmap == MAP_FAILED) {
+    fprintf(stderr, "kmap failed %s\n", strerror(errno));
+    exit(1);
+  }
+  close(fd);
+  pcb = reinterpret_cast<struct pcb *>(reinterpret_cast<uintptr_t>(kmemmap) +
+    (kpcb & 0xfff));
+  root = &memmap[(pcb->pcb_cr3 & PAGE_FRAME) >> 3];
+  printf("memmap %p cr3 %#lx root %p\n", memmap, pcb->pcb_cr3, root);
+}
+
+uint64_t GetPhysicalAddress(uint8_t* virtual_address) {
+  uintptr_t va;
+  u_long pml4e, pdpte, pde, pte;
+  va = reinterpret_cast<uintptr_t>(virtual_address);
+  pml4e = root[va >> 39];
+  pdpte = memmap[((pml4e & PAGE_FRAME) >> 3) + ((va >> 30) & 0x1ff)];
+  pde = memmap[((pdpte & PAGE_FRAME) >> 3) + ((va >> 21) & 0x1ff)];
+  if (pde & PDE_PS)
+      return (pde & PAGE_FRAME) + (va & 0xfff);
+  pte = memmap[((pde & PAGE_FRAME) >> 3) + ((va >> 12) & 0x1ff)];
+  return (pte & PAGE_FRAME);
+}
+
+#endif
 
 void SetupMapping(uint64_t* mapping_size, void** mapping) {
   *mapping_size = 
@@ -105,8 +189,14 @@ void SetupMapping(uint64_t* mapping_size, void** mapping) {
           fraction_of_physical_memory));
 
   *mapping = mmap(NULL, *mapping_size, PROT_READ | PROT_WRITE,
-      MAP_POPULATE | MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+#ifdef MAP_POPULATE
+      MAP_POPULATE |
+#endif
+      MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
   assert(*mapping != (void*)-1);
+#ifndef MAP_POPULATE
+  mlock(*mapping, *mapping_size);
+#endif
 
   // Initialize the mapping so that the pages are non-empty.
   printf("[!] Initializing large memory mapping ...");
@@ -132,16 +222,19 @@ bool GetMappingsForPhysicalRanges(
   void* mapping;
   SetupMapping(&mapping_size, &mapping);
 
+#if defined(__linux__)
   int pagemap = open("/proc/self/pagemap", O_RDONLY);
   assert(pagemap >= 0);
 
   // Don't assert if opening this fails, the code needs to run under usermode.
   int kpageflags = open("/proc/kpageflags", O_RDONLY);
+#endif
 
   // Iterate over the entire mapping, identifying the physical addresses for 
   // each 4k-page.
   for (uint64_t offset = 0; offset < mapping_size; offset += 0x1000) {
     uint8_t* virtual_address = static_cast<uint8_t*>(mapping) + offset;
+#if defined(__linux__)
     uint64_t page_frame_number = GetPageFrameNumber(pagemap, virtual_address);
     // Read the flags for this page if we have access to kpageflags.
     uint64_t page_flags = 0;
@@ -160,6 +253,11 @@ bool GetMappingsForPhysicalRanges(
       physical_address = (page_frame_number * 0x1000) + 
        (reinterpret_cast<uintptr_t>(virtual_address) & 0xFFF);
     }
+#elif defined(__FreeBSD__)
+    uint64_t physical_address = GetPhysicalAddress(virtual_address);
+#else
+#error Port me
+#endif
 
     //printf("[!] %lx is %lx\n", (uint64_t)virtual_address, 
     //    (uint64_t)physical_address);
@@ -180,6 +278,7 @@ bool GetMappingsForPhysicalRanges(
   return false;
 }
 
+#ifdef __linux__
 //
 // Example code for perf_event_open from the perf_event_open manpage.
 static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
@@ -188,6 +287,7 @@ static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
   ret = syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
   return ret;
 }
+#endif
 
 uint64_t HammerAddressesStandard(
     const std::pair<uint64_t, uint64_t>& first_range,
@@ -225,14 +325,22 @@ uint64_t HammerAllReachablePages(uint64_t presumed_row_size,
   uint64_t total_bitflips = 0;
 
   pages_per_row.resize(memory_mapping_size / presumed_row_size);
+#ifdef __linux__
   int pagemap = open("/proc/self/pagemap", O_RDONLY);
   assert(pagemap >= 0);
+#endif
 
   printf("[!] Identifying rows for accessible pages ... ");
   for (uint64_t offset = 0; offset < memory_mapping_size; offset += 0x1000) {
     uint8_t* virtual_address = static_cast<uint8_t*>(memory_mapping) + offset;
+#if defined(__linux__)
     uint64_t page_frame_number = GetPageFrameNumber(pagemap, virtual_address);
     uint64_t physical_address = page_frame_number * 0x1000;
+#elif defined(__FreeBSD__)
+    uint64_t physical_address = GetPhysicalAddress(virtual_address);
+#else
+#error Port me
+#endif
     uint64_t presumed_row_index = physical_address / presumed_row_size;
     //printf("[!] put va %lx pa %lx into row %ld\n", (uint64_t)virtual_address,
     //    physical_address, presumed_row_index);
@@ -295,8 +403,16 @@ uint64_t HammerAllReachablePages(uint64_t presumed_row_size,
               "%lx and %lx\n", number_of_bitflips_in_target, row_index+1,
               ((row_index+1)*presumed_row_size), 
               ((row_index+2)*presumed_row_size)-1,
+#if defined(__linux__)
               GetPageFrameNumber(pagemap, first_row_page)*0x1000, 
-              GetPageFrameNumber(pagemap, second_row_page)*0x1000);
+              GetPageFrameNumber(pagemap, second_row_page)*0x1000
+#elif defined(__FreeBSD__)
+	      GetPhysicalAddress(first_row_page),
+	      GetPhysicalAddress(second_row_page)
+#else
+#error Port me
+#endif
+	      );
           total_bitflips += number_of_bitflips_in_target;
         }
       }
@@ -351,6 +467,9 @@ int main(int argc, char** argv) {
   }
 
   signal(SIGALRM, HammeredEnough);
+#if defined(__FreeBSD__)
+  freebsd_init();
+#endif
 
   if (should_fork) {
     pid_t pid = fork();
