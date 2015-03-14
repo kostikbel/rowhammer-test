@@ -18,11 +18,10 @@
 // Compilation instructions:
 //   g++ -std=c++11 [filename]
 //
-// ./test_double_sided_hammering [-t nsecs] [-p percentage] [-f outputfile]
+// ./double_sided_rowhammer [-t nsecs] [-p percentage]
 //
 // Hammers for nsecs seconds, acquires the described fraction of memory (0.0
-// to 0.9 or so). Normally writes to stdout, but if -f is provided, will fork
-// and write to the specified file instead.
+// to 0.9 or so).
 
 #include <sys/types.h>
 #ifdef __linux__
@@ -34,7 +33,6 @@
 #include <inttypes.h>
 #ifdef __linux__
 #include <linux/kernel-page-flags.h>
-#include <linux/perf_event.h>
 #endif
 #ifdef __FreeBSD__
 #include <sys/sysctl.h>
@@ -114,14 +112,13 @@ bool IsRangeInMap(const std::pair<uint64_t, uint64_t>& range,
 
 #ifdef __linux__
 uint64_t GetPageFrameNumber(int pagemap, uint8_t* virtual_address) {
-    // Read the entry in the pagemap.
-    off_t pos = lseek(pagemap,
-        (reinterpret_cast<uintptr_t>(virtual_address) / 0x1000) * 8, SEEK_SET);
-    uint64_t value;
-    int got = read(pagemap, &value, 8);
-    assert(got == 8);
-    uint64_t page_frame_number = value & ((1ULL << 54)-1);
-    return page_frame_number; 
+  // Read the entry in the pagemap.
+  uint64_t value;
+  int got = pread(pagemap, &value, 8,
+                  (reinterpret_cast<uintptr_t>(virtual_address) / 0x1000) * 8);
+  assert(got == 8);
+  uint64_t page_frame_number = value & ((1ULL << 54)-1);
+  return page_frame_number;
 }
 #endif
 
@@ -239,8 +236,7 @@ bool GetMappingsForPhysicalRanges(
     // Read the flags for this page if we have access to kpageflags.
     uint64_t page_flags = 0;
     if (kpageflags >= 0) {
-      int pos = lseek(kpageflags, page_frame_number * 8, SEEK_SET);
-      int got = read(kpageflags, &page_flags, 8);
+      int got = pread(kpageflags, &page_flags, 8, page_frame_number * 8);
       assert(got == 8);
     }
 
@@ -278,24 +274,15 @@ bool GetMappingsForPhysicalRanges(
   return false;
 }
 
-#ifdef __linux__
-//
-// Example code for perf_event_open from the perf_event_open manpage.
-static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
-  int cpu, int group_fd, unsigned long flags) {
-  int ret;
-  ret = syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
-  return ret;
-}
-#endif
-
 uint64_t HammerAddressesStandard(
     const std::pair<uint64_t, uint64_t>& first_range,
     const std::pair<uint64_t, uint64_t>& second_range,
     uint64_t number_of_reads) {
-  uint64_t* first_pointer = reinterpret_cast<uint64_t*>(first_range.first);
-  uint64_t* second_pointer = reinterpret_cast<uint64_t*>(second_range.first);
-  volatile uint64_t sum = 0;
+  volatile uint64_t* first_pointer =
+      reinterpret_cast<uint64_t*>(first_range.first);
+  volatile uint64_t* second_pointer =
+      reinterpret_cast<uint64_t*>(second_range.first);
+  uint64_t sum = 0;
 
   while (number_of_reads-- > 0) {
     sum += first_pointer[0];
@@ -380,8 +367,6 @@ uint64_t HammerAllReachablePages(uint64_t presumed_row_size,
         for (uint8_t* target_page : pages_per_row[row_index+1]) {
           memset(target_page, 0xFF, 0x1000);
         }
-        // Test sleep code to see how this affects the distribution.
-        sleep(1);
         // Now hammer the two pages we care about.
         std::pair<uint64_t, uint64_t> first_page_range(
             reinterpret_cast<uint64_t>(first_row_page), 
@@ -422,14 +407,13 @@ uint64_t HammerAllReachablePages(uint64_t presumed_row_size,
   return total_bitflips;
 }
 
-uint64_t HammerAllReachableRows(HammerFunction* hammer, 
-    uint64_t number_of_reads) {
+void HammerAllReachableRows(HammerFunction* hammer, uint64_t number_of_reads) {
   uint64_t mapping_size;
   void* mapping;
   SetupMapping(&mapping_size, &mapping);
 
-  uint64_t result = HammerAllReachablePages(1024*256, mapping, mapping_size,
-    hammer, number_of_reads);
+  HammerAllReachablePages(1024*256, mapping, mapping_size,
+                          hammer, number_of_reads);
 }
 
 void HammeredEnough(int sig) {
@@ -443,11 +427,9 @@ void HammeredEnough(int sig) {
 int main(int argc, char** argv) {
   // Turn off stdout buffering when it is a pipe.
   setvbuf(stdout, NULL, _IONBF, 0);
-  bool should_fork = false;
-  char outputfilename[1024];
 
   int opt;
-  while ((opt = getopt(argc, argv, "t:p:f:r:")) != -1) {
+  while ((opt = getopt(argc, argv, "t:p:")) != -1) {
     switch (opt) {
       case 't':
         number_of_seconds_to_hammer = atoi(optarg);
@@ -455,13 +437,8 @@ int main(int argc, char** argv) {
       case 'p':
         fraction_of_physical_memory = atof(optarg);
         break;
-      case 'f':
-        memset(outputfilename, 0, sizeof(outputfilename));
-        strncpy(outputfilename, optarg, 1023);
-        should_fork = true;
-        break;
       default:
-        fprintf(stderr, "Usage: %s [-t nsecs] [-p percent] [-f outfile]\n", 
+        fprintf(stderr, "Usage: %s [-t nsecs] [-p percent]\n", 
             argv[0]);
         exit(EXIT_FAILURE);
     }
@@ -472,21 +449,7 @@ int main(int argc, char** argv) {
   freebsd_init();
 #endif
 
-  if (should_fork) {
-    pid_t pid = fork();
-    if (pid == 0) {
-      fpos_t pos;
-      int fd;
-      fflush(stdout);
-      fgetpos(stdout, &pos);
-      fd = dup(fileno(stdout));
-      freopen(outputfilename, "w", stdout);
-      alarm(number_of_seconds_to_hammer);
-      HammerAllReachableRows(&HammerAddressesStandard, number_of_reads);
-    }
-  } else {
-    printf("[!] Starting the testing process...\n");
-    alarm(number_of_seconds_to_hammer);
-    HammerAllReachableRows(&HammerAddressesStandard, number_of_reads);
-  }
+  printf("[!] Starting the testing process...\n");
+  alarm(number_of_seconds_to_hammer);
+  HammerAllReachableRows(&HammerAddressesStandard, number_of_reads);
 }

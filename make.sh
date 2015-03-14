@@ -16,4 +16,7 @@
 
 set -eu
 
-g++ -g -Wall -Werror -O2 rowhammer_test.cc -o rowhammer_test
+cflags="-g -Wall -Werror -O2"
+
+g++ $cflags rowhammer_test.cc -o rowhammer_test
+g++ $cflags -std=c++11 double_sided_rowhammer.cc -o double_sided_rowhammer
